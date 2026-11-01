@@ -1,0 +1,8 @@
+.git
+.github
+.secrets
+.DS_Store
+README.md
+scripts
+*.log
+*-key.json

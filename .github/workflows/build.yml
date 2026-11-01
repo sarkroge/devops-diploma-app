@@ -1,0 +1,85 @@
+name: Build, test and publish
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      YC_REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare image version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_SHA"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+            if [[ ! "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo 'Git tag must also be a valid Docker tag.' >&2
+              exit 1
+            fi
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build application image
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          docker build --pull --platform linux/amd64 \
+            --build-arg "APP_VERSION=$APP_VERSION" \
+            --build-arg "VCS_REF=$GITHUB_SHA" \
+            --tag diploma-app:test .
+
+      - name: Validate nginx configuration and HTTP responses
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          docker run --rm diploma-app:test nginx -t
+          docker run -d --name diploma-test -p 127.0.0.1:8080:8080 diploma-app:test
+          bash scripts/smoke-test.sh http://127.0.0.1:8080 "$APP_VERSION"
+
+      - name: Show container logs and clean up
+        if: always()
+        run: |
+          docker logs diploma-test 2>/dev/null || true
+          docker rm -f diploma-test 2>/dev/null || true
+
+      - name: Check registry configuration
+        if: github.event_name != 'pull_request'
+        run: |
+          test -n "$YC_REGISTRY_ID" || { echo 'Set Actions variable YC_REGISTRY_ID.' >&2; exit 1; }
+
+      - name: Log in to Yandex Container Registry
+        if: github.event_name != 'pull_request'
+        uses: yc-actions/yc-cr-login@v3
+        with:
+          yc-sa-json-credentials: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
+
+      - name: Publish tested image
+        if: github.event_name != 'pull_request'
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          repository="cr.yandex/$YC_REGISTRY_ID/diploma-app"
+          docker tag diploma-app:test "$repository:sha-$GITHUB_SHA"
+          docker push "$repository:sha-$GITHUB_SHA"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            docker tag diploma-app:test "$repository:$APP_VERSION"
+            docker push "$repository:$APP_VERSION"
+          fi
+          printf 'Published image: `%s:sha-%s`\n' "$repository" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
