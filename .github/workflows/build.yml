@@ -1,4 +1,4 @@
-name: Build, test and publish
+name: Build, test, publish and deploy
 
 on:
   push:
@@ -14,6 +14,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
     env:
       YC_REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}
     steps:
@@ -70,6 +72,7 @@ jobs:
           yc-sa-json-credentials: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
 
       - name: Publish tested image
+        id: publish
         if: github.event_name != 'pull_request'
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
@@ -82,4 +85,55 @@ jobs:
             docker tag diploma-app:test "$repository:$APP_VERSION"
             docker push "$repository:$APP_VERSION"
           fi
+          image_ref="$(docker image inspect "$repository:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
+          test -n "$image_ref"
+          echo "image=$image_ref" >> "$GITHUB_OUTPUT"
           printf 'Published image: `%s:sha-%s`\n' "$repository" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: diploma-app-deploy
+      cancel-in-progress: false
+    env:
+      APP_URL: ${{ vars.APP_URL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install matching kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.37.2
+
+      - name: Configure cluster access
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+          test -n "$KUBE_CONFIG" || { echo 'Set Actions secret KUBE_CONFIG.' >&2; exit 1; }
+          test -n "$APP_URL" || { echo 'Set Actions variable APP_URL.' >&2; exit 1; }
+          umask 077
+          kubeconfig_path="$RUNNER_TEMP/diploma-kubeconfig"
+          printf '%s' "$KUBE_CONFIG" > "$kubeconfig_path"
+          echo "KUBECONFIG=$kubeconfig_path" >> "$GITHUB_ENV"
+
+      - name: Deploy tested image by digest
+        env:
+          IMAGE_REF: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          test -n "$IMAGE_REF"
+          kubectl -n diploma set image deployment/diploma-app "diploma-app=$IMAGE_REF"
+          kubectl -n diploma rollout status deployment/diploma-app --timeout=300s
+
+      - name: Verify public application version
+        run: |
+          bash scripts/smoke-test.sh "$APP_URL" "$GITHUB_REF_NAME"
+          printf 'Deployed release: `%s`\n' "$GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove runner credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/diploma-kubeconfig"
